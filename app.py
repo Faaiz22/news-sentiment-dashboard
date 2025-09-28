@@ -28,7 +28,7 @@ from typing import List, Dict, Optional
 # Configuration
 class Config:
     NEWS_API_KEY = "pub_e9c5fbef127c4d8ea7b60c1f05259361"  
-    NEWS_API_URL = "https://newsdata.io/api/1/pub_e9c5fbef127c4d8ea7b60c1f05259361"
+    NEWS_API_URL = "https://newsdata.io/api/1/news?"
     UPDATE_INTERVAL = 300  # 5 minutes in seconds
     MAX_ARTICLES = 100
 
