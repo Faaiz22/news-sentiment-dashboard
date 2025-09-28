@@ -44,86 +44,94 @@ class SimpleNewsFetcher:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "news-sentiment-monitor/1.0"})
 
-    def fetch_news(self, category: Optional[str] = None, country: Optional[str] = None,
-                   language: str = "en", max_pages: int = 1) -> List[Dict]:
-        """
-        Fetch news from NewsData.io /latest endpoint.
-        Returns normalized list of articles.
-        max_pages controls pagination (page 1..max_pages).
-        """
-        articles: List[Dict] = []
-        for page in range(1, max_pages + 1):
-            params = {
-                "apikey": self.api_key,
-                "language": language,
-                "page": page
+def fetch_news(self, category: Optional[str] = None, country: Optional[str] = None,
+               language: str = "en", max_pages: int = 1) -> List[Dict]:
+    """
+    Fetch news using NewsData.io /latest with cursor pagination.
+    - First request is made WITHOUT 'page' param.
+    - For subsequent requests, use the `nextPage` token returned by the API.
+    - max_pages: how many pages (requests) to follow (1 = only the first page).
+    """
+    articles: List[Dict] = []
+    page_token = None  # None => first request without 'page'
+    pages_fetched = 0
+
+    while pages_fetched < max_pages:
+        params = {
+            "apikey": self.api_key,
+            "language": language,
+        }
+        if category:
+            params["category"] = category
+        if country:
+            params["country"] = country
+        # only include 'page' when we have a token (NewsData expects the nextPage token)
+        if page_token:
+            params["page"] = page_token
+
+        try:
+            resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=12)
+        except requests.RequestException as e:
+            st.error(f"Network/API error while calling NewsData.io: {e}")
+            break
+
+        if resp.status_code != 200:
+            # show the body to debug invalid params / quota / keys
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text[:1000]
+            st.error(f"NewsData API returned {resp.status_code}: {body}")
+            break
+
+        try:
+            data = resp.json()
+        except ValueError:
+            st.error("NewsData returned invalid JSON")
+            break
+
+        # defensive check for status / results
+        if data.get("status") not in ("success", "ok"):
+            st.error(f"NewsData non-success status: {data.get('status')} - {data.get('results') or data.get('message') or data}")
+            break
+
+        results = data.get("results") or []
+        for r in results:
+            title = (r.get("title") or "").strip()
+            if not title or title.lower() in ("[removed]", "removed"):
+                continue
+            description = (r.get("description") or r.get("content") or "").strip()
+            source = r.get("source_id") or r.get("source") or "unknown"
+            url = r.get("link") or r.get("url") or ""
+            pubdate = r.get("pubDate") or ""
+
+            normalized = {
+                "title": title,
+                "description": description,
+                "source": source,
+                "url": url,
+                "published_at": pubdate,
+                "category": category or r.get("category") or "unknown",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
             }
-            if category:
-                params["category"] = category
-            if country:
-                params["country"] = country
+            articles.append(normalized)
 
-            try:
-                resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=12)
-            except requests.RequestException as e:
-                # network-level error
-                st.error(f"Network/API error while calling NewsData.io: {e}")
-                break
+        pages_fetched += 1
 
-            # Show response body for debugging on non-200
-            if resp.status_code != 200:
-                body = None
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = resp.text[:1000]
-                st.error(f"NewsData API returned {resp.status_code}: {body}")
-                break
+        # Respect API-provided nextPage token (cursor). If absent — stop.
+        page_token = data.get("nextPage")
+        if not page_token:
+            break
 
-            try:
-                data = resp.json()
-            except ValueError:
-                st.error("NewsData returned invalid JSON")
-                break
+        # safety cap
+        if len(articles) >= Config.MAX_ARTICLES:
+            articles = articles[: Config.MAX_ARTICLES]
+            break
 
-            status = data.get("status")
-            if status not in ("success", "ok"):
-                st.error(f"NewsData non-success status: {status} - {data.get('message') or data}")
-                break
+        # gentle pause before next page
+        time.sleep(0.3)
 
-            results = data.get("results") or []
-            if not isinstance(results, list) or len(results) == 0:
-                # no results on this page -> stop
-                break
-
-            for r in results:
-                title = (r.get("title") or "").strip()
-                if not title or title.lower() in ("[removed]", "removed"):
-                    continue
-                description = (r.get("description") or r.get("content") or "").strip()
-                source = r.get("source_id") or r.get("source") or "unknown"
-                url = r.get("link") or r.get("url") or ""
-                pubdate = r.get("pubDate") or ""
-
-                normalized = {
-                    "title": title,
-                    "description": description,
-                    "source": source,
-                    "url": url,
-                    "published_at": pubdate,
-                    "category": category or r.get("category") or "unknown",
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                }
-                articles.append(normalized)
-
-            # safety cap
-            if len(articles) >= Config.MAX_ARTICLES:
-                articles = articles[: Config.MAX_ARTICLES]
-                break
-
-            time.sleep(0.3)  # gentle pause for pagination
-
-        return articles
+    return articles
 
 # -------------------------
 # SimpleSentimentModel
