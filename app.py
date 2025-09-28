@@ -1,4 +1,5 @@
 # app.py
+# app.py
 """
 News Sentiment Monitor (Streamlit)
 
@@ -7,7 +8,6 @@ News Sentiment Monitor (Streamlit)
 import os
 import time
 import re
-import json
 import pickle
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -28,10 +28,11 @@ from sklearn.metrics import accuracy_score
 # Configuration
 # -------------------------
 class Config:
-    NEWS_API_KEY = os.getenv("NEWSDATA_API_KEY", "")  # or keep your key from sidebar
-    NEWS_API_URL = "https://newsdata.io/api/1/latest"  # <-- use /latest, not /news
+    NEWS_API_KEY = os.getenv("NEWSDATA_API_KEY", "")  # default from env; sidebar can override
+    NEWS_API_URL = "https://newsdata.io/api/1/latest"  # use /latest to query recent news with category/country
     UPDATE_INTERVAL = 300
     MAX_ARTICLES = 500
+
 # -------------------------
 # SimpleNewsFetcher (NewsData.io)
 # -------------------------
@@ -43,59 +44,84 @@ class SimpleNewsFetcher:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "news-sentiment-monitor/1.0"})
 
-    def fetch_news(self, category: str = None, country: str = None, language: str = "en", page: int = 1) -> List[Dict]:
-        params = {
-            "apikey": self.api_key,
-            "language": language,
-            "page": page
-        }
-        if category:
-            params["category"] = category
-        if country:
-            params["country"] = country
+    def fetch_news(self, category: Optional[str] = None, country: Optional[str] = None,
+                   language: str = "en", max_pages: int = 1) -> List[Dict]:
+        """
+        Fetch news from NewsData.io /latest endpoint.
+        Returns normalized list of articles.
+        max_pages controls pagination (page 1..max_pages).
+        """
+        articles: List[Dict] = []
+        for page in range(1, max_pages + 1):
+            params = {
+                "apikey": self.api_key,
+                "language": language,
+                "page": page
+            }
+            if category:
+                params["category"] = category
+            if country:
+                params["country"] = country
 
-        try:
-            resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=10)
-        except requests.RequestException as e:
-            st.error(f"Network error while calling NewsData.io: {e}")
-            return []
-
-        # If non-200, show response body so we can debug (422 details usually in the body)
-        if resp.status_code != 200:
-            body = ""
             try:
-                body = resp.json()
-            except Exception:
-                body = resp.text[:1000]
-            st.error(f"NewsData API returned {resp.status_code}: {body}")
-            return []
+                resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=12)
+            except requests.RequestException as e:
+                # network-level error
+                st.error(f"Network/API error while calling NewsData.io: {e}")
+                break
 
-        try:
-            data = resp.json()
-        except ValueError:
-            st.error("NewsData returned invalid JSON")
-            return []
+            # Show response body for debugging on non-200
+            if resp.status_code != 200:
+                body = None
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text[:1000]
+                st.error(f"NewsData API returned {resp.status_code}: {body}")
+                break
 
-        # NewsData returns {"status":"success","results":[...], ...}
-        if data.get("status") not in ("success", "ok"):
-            st.error(f"NewsData non-success status: {data.get('status')} - {data.get('message') or data}")
-            return []
+            try:
+                data = resp.json()
+            except ValueError:
+                st.error("NewsData returned invalid JSON")
+                break
 
-        results = data.get("results", [])
-        articles = []
-        for r in results:
-            title = r.get("title") or ""
-            if not title or title.strip().lower() in ("[removed]", "removed"):
-                continue
-            articles.append({
-                "title": title.strip(),
-                "description": r.get("description") or "",
-                "source": r.get("source_id") or r.get("source") or "unknown",
-                "url": r.get("link") or r.get("url") or "",
-                "published_at": r.get("pubDate") or "",
-                "category": category or r.get("category") or "unknown",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            })
+            status = data.get("status")
+            if status not in ("success", "ok"):
+                st.error(f"NewsData non-success status: {status} - {data.get('message') or data}")
+                break
+
+            results = data.get("results") or []
+            if not isinstance(results, list) or len(results) == 0:
+                # no results on this page -> stop
+                break
+
+            for r in results:
+                title = (r.get("title") or "").strip()
+                if not title or title.lower() in ("[removed]", "removed"):
+                    continue
+                description = (r.get("description") or r.get("content") or "").strip()
+                source = r.get("source_id") or r.get("source") or "unknown"
+                url = r.get("link") or r.get("url") or ""
+                pubdate = r.get("pubDate") or ""
+
+                normalized = {
+                    "title": title,
+                    "description": description,
+                    "source": source,
+                    "url": url,
+                    "published_at": pubdate,
+                    "category": category or r.get("category") or "unknown",
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                }
+                articles.append(normalized)
+
+            # safety cap
+            if len(articles) >= Config.MAX_ARTICLES:
+                articles = articles[: Config.MAX_ARTICLES]
+                break
+
+            time.sleep(0.3)  # gentle pause for pagination
 
         return articles
 
@@ -108,7 +134,6 @@ class SimpleSentimentModel:
         self.is_trained = False
 
     def create_training_data(self) -> pd.DataFrame:
-        """Generate small synthetic labeled dataset for demonstration."""
         positive_samples = [
             "Stock market reaches new heights with strong earnings",
             "Breakthrough in medical research offers new hope",
@@ -146,17 +171,15 @@ class SimpleSentimentModel:
         ]
 
         data = []
-        for text in positive_samples:
-            data.append({"text": text, "sentiment": 1})
-        for text in negative_samples:
-            data.append({"text": text, "sentiment": 0})
-
+        for t in positive_samples:
+            data.append({"text": t, "sentiment": 1})
+        for t in negative_samples:
+            data.append({"text": t, "sentiment": 0})
         return pd.DataFrame(data)
 
     def preprocess_text(self, text: str) -> str:
         if not isinstance(text, str):
             return ""
-        # lowercase, remove non-letters (keep spaces), collapse spaces
         text = re.sub(r"[^a-zA-Z\s]", "", text.lower())
         text = re.sub(r"\s+", " ", text).strip()
         return text
@@ -168,15 +191,12 @@ class SimpleSentimentModel:
         X = df["processed_text"].values
         y = df["sentiment"].values
 
-        # train-test split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-        self.pipeline = Pipeline(
-            [
-                ("tfidf", TfidfVectorizer(max_features=2000, stop_words="english")),
-                ("clf", LogisticRegression(random_state=42, max_iter=400, solver="liblinear")),
-            ]
-        )
+        self.pipeline = Pipeline([
+            ("tfidf", TfidfVectorizer(max_features=2000, stop_words="english")),
+            ("clf", LogisticRegression(random_state=42, max_iter=400, solver="liblinear"))
+        ])
 
         self.pipeline.fit(X_train, y_train)
         y_pred = self.pipeline.predict(X_test)
@@ -196,18 +216,16 @@ class SimpleSentimentModel:
         preds = self.pipeline.predict([processed])
         probs = self.pipeline.predict_proba([processed])[0] if hasattr(self.pipeline, "predict_proba") else [0.5, 0.5]
 
-        label = preds[0]
-        # logistic returns [prob_negative, prob_positive] if classes are [0,1]
         prob_positive = float(probs[1]) if len(probs) > 1 else float(probs[0])
         prob_negative = float(probs[0]) if len(probs) > 1 else 1.0 - prob_positive
-        sentiment = "positive" if int(label) == 1 else "negative"
+        sentiment = "positive" if int(preds[0]) == 1 else "negative"
         confidence = max(prob_positive, prob_negative)
 
         return {
             "sentiment": sentiment,
             "confidence": float(confidence),
             "probability_positive": prob_positive,
-            "probability_negative": prob_negative,
+            "probability_negative": prob_negative
         }
 
     def save_model(self, path: str):
@@ -257,7 +275,6 @@ class SimpleDataStore:
 # -------------------------
 class ColadNewsSentimentPipeline:
     def __init__(self, api_key: Optional[str] = None):
-        # prefer explicit key, else env
         self.api_key = (api_key if api_key is not None else Config.NEWS_API_KEY) or ""
         self.fetcher = None
         if self.api_key:
@@ -271,27 +288,24 @@ class ColadNewsSentimentPipeline:
         self.last_update: Optional[datetime] = None
 
     def setup(self):
-        # train model (small synthetic dataset)
         acc = self.model.train_model()
         st.success(f"Model trained (sample data) — accuracy: {acc:.2%}")
 
-        # attempt initial fetch if fetcher available
         if self.fetcher:
             self.fetch_and_process_news()
         else:
             self._load_sample_data()
 
-    def fetch_and_process_news(self, countries: List[str] = None, categories: List[str] = None):
+    def fetch_and_process_news(self, countries: Optional[List[Optional[str]]] = None, categories: Optional[List[str]] = None):
         if not self.fetcher:
-            st.warning("No API key / fetcher configured — using sample data.")
+            st.warning("No API key configured — using sample data.")
             self._load_sample_data()
             return
 
-        # sensible defaults
         if categories is None:
             categories = ["technology", "business", "health", "science", "world"]
         if countries is None:
-            countries = [None]  # None means no country filter
+            countries = [None]  # None indicates no country filter
 
         all_articles = []
         for country in countries:
@@ -303,7 +317,6 @@ class ColadNewsSentimentPipeline:
                     fetched = []
                 all_articles.extend(fetched)
                 time.sleep(0.2)
-
                 if len(all_articles) >= Config.MAX_ARTICLES:
                     break
             if len(all_articles) >= Config.MAX_ARTICLES:
@@ -313,18 +326,18 @@ class ColadNewsSentimentPipeline:
             st.warning("No articles fetched from NewsData.io — check API key / quota.")
             return
 
-        # Deduplicate by url/title
+        # dedupe
         seen = set()
-        unique_articles = []
+        unique = []
         for a in all_articles:
-            key = (a.get("url") or a.get("title", "")).strip()
+            key = (a.get("url") or a.get("title") or "").strip()
             if not key or key in seen:
                 continue
             seen.add(key)
-            unique_articles.append(a)
+            unique.append(a)
 
         processed = []
-        for art in unique_articles:
+        for art in unique:
             title = art.get("title", "")
             desc = art.get("description", "")
             text = f"{title} {desc}".strip()
@@ -336,12 +349,11 @@ class ColadNewsSentimentPipeline:
                 "confidence": sentiment["confidence"],
                 "probability_positive": sentiment["probability_positive"],
                 "probability_negative": sentiment["probability_negative"],
-                "processed_at": datetime.utcnow().isoformat() + "Z",
+                "processed_at": datetime.utcnow().isoformat() + "Z"
             }
             processed.append(proc)
 
-        # store
-        self.data_store.add_articles(unique_articles)
+        self.data_store.add_articles(unique)
         self.data_store.add_processed_articles(processed)
         self.last_update = datetime.utcnow()
         st.success(f"Fetched & processed {len(processed)} articles")
@@ -353,29 +365,28 @@ class ColadNewsSentimentPipeline:
                 "description": "Company shows strong growth across all sectors",
                 "source": "TechNews",
                 "category": "technology",
-                "published_at": (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z",
+                "published_at": (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z"
             },
             {
                 "title": "Market Volatility Concerns Investors Worldwide",
                 "description": "Economic uncertainty continues to affect global markets",
                 "source": "Financial Times",
                 "category": "business",
-                "published_at": (datetime.utcnow() - timedelta(hours=2)).isoformat() + "Z",
-            },
+                "published_at": (datetime.utcnow() - timedelta(hours=2)).isoformat() + "Z"
+            }
         ]
         processed = []
         for a in sample_articles:
             text = f"{a['title']} {a.get('description','')}".strip()
             sentiment = self.model.predict_sentiment(text)
-            proc = {
-                **a,
-                "text": text,
-                "sentiment": sentiment["sentiment"],
-                "confidence": sentiment["confidence"],
-                "probability_positive": sentiment["probability_positive"],
-                "probability_negative": sentiment["probability_negative"],
-                "processed_at": datetime.utcnow().isoformat() + "Z",
-            }
+            proc = {**a,
+                    "text": text,
+                    "sentiment": sentiment["sentiment"],
+                    "confidence": sentiment["confidence"],
+                    "probability_positive": sentiment["probability_positive"],
+                    "probability_negative": sentiment["probability_negative"],
+                    "processed_at": datetime.utcnow().isoformat() + "Z"
+                    }
             processed.append(proc)
 
         self.data_store.add_processed_articles(processed)
@@ -390,7 +401,7 @@ def create_dashboard():
     st.title("📈 News Sentiment Monitor — NewsData.io")
     st.markdown("Lightweight demo that fetches headlines from NewsData.io and runs a toy sentiment classifier.")
 
-    # Sidebar: API key + options
+    # Sidebar
     st.sidebar.header("Configuration")
     api_key_input = st.sidebar.text_input(
         "NewsData.io API Key (optional). If empty, env var NEWSDATA_API_KEY will be used.",
@@ -398,10 +409,9 @@ def create_dashboard():
         type="password",
     )
     use_sample_if_no_key = st.sidebar.checkbox("Use sample data if no key", value=True)
-    fetch_button = st.sidebar.button("Initialize / Reinitialize")
+    init_button = st.sidebar.button("Initialize / Reinitialize")
 
-    # initialize pipeline in session_state
-    if "pipeline" not in st.session_state or fetch_button:
+    if "pipeline" not in st.session_state or init_button:
         key_to_use = api_key_input.strip() or Config.NEWS_API_KEY
         if not key_to_use and not use_sample_if_no_key:
             st.sidebar.error("Provide API key or enable 'Use sample data' to proceed.")
@@ -424,12 +434,10 @@ def create_dashboard():
         if pipeline.last_update:
             st.info(f"Last update (UTC): {pipeline.last_update.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-    # Data view
     recent = pipeline.data_store.get_recent_articles(200)
     stats = pipeline.data_store.get_sentiment_stats()
 
     if stats["total"] > 0:
-        # Metrics
         pos = stats["positive"]
         neg = stats["negative"]
         total = stats["total"]
@@ -442,26 +450,21 @@ def create_dashboard():
         c3.metric("Negative", f"{neg} ({100-pos_pct:.1f}%)")
         c4.metric("Avg Confidence", f"{avg_conf:.2%}")
 
-        # Pie chart
-        fig = px.pie(
-            names=["Positive", "Negative"],
-            values=[pos, neg],
-            title="Sentiment distribution (recent)",
-        )
+        fig = px.pie(names=["Positive", "Negative"], values=[pos, neg], title="Sentiment distribution (recent)")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Table of recent articles
         df = pd.DataFrame(recent)
-        # prefer readable columns, guard missing keys
-        display_df = df[["title", "source", "category", "sentiment", "confidence", "processed_at"]].copy()
-        display_df["confidence"] = display_df["confidence"].apply(lambda x: f"{float(x):.2%}" if pd.notnull(x) else "N/A")
+        cols = ["title", "source", "category", "sentiment", "confidence", "processed_at"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        display_df = df[cols].copy()
+        display_df["confidence"] = display_df["confidence"].apply(lambda x: f"{float(x):.2%}" if x != "" else "N/A")
         st.subheader("Recent articles")
         st.dataframe(display_df, use_container_width=True, height=400)
 
-        # Most positive / negative lists
         pos_list = [a for a in recent if a.get("sentiment") == "positive"]
         pos_list = sorted(pos_list, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
-
         neg_list = [a for a in recent if a.get("sentiment") == "negative"]
         neg_list = sorted(neg_list, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
 
@@ -477,7 +480,6 @@ def create_dashboard():
                     st.markdown("---")
             else:
                 st.write("No positive articles found.")
-
         with rcol:
             st.subheader("🔴 Most negative")
             if neg_list:
@@ -492,11 +494,9 @@ def create_dashboard():
     else:
         st.warning("No processed articles yet. Click 'Refresh Data' to fetch (or initialize with API key).")
 
-    # Auto refresh handling
     if auto_refresh:
         time.sleep(30)
         st.experimental_rerun()
-
 
 if __name__ == "__main__":
     create_dashboard()
