@@ -28,12 +28,10 @@ from sklearn.metrics import accuracy_score
 # Configuration
 # -------------------------
 class Config:
-    # Prefer environment variable; empty string by default
-    NEWS_API_KEY = os.getenv("NEWSDATA_API_KEY", "")
-    NEWS_API_URL = "https://newsdata.io/api/1/news"  # NewsData.io endpoint
-    UPDATE_INTERVAL = 300  # seconds
+    NEWS_API_KEY = os.getenv("NEWSDATA_API_KEY", "")  # or keep your key from sidebar
+    NEWS_API_URL = "https://newsdata.io/api/1/latest"  # <-- use /latest, not /news
+    UPDATE_INTERVAL = 300
     MAX_ARTICLES = 500
-
 # -------------------------
 # SimpleNewsFetcher (NewsData.io)
 # -------------------------
