@@ -28,8 +28,9 @@ from sklearn.metrics import accuracy_score
 # Configuration
 # -------------------------
 class Config:
-    NEWS_API_KEY = os.getenv("NEWSDATA_API_KEY", "")  # default from env; sidebar can override
-    NEWS_API_URL = "https://newsdata.io/api/1/latest"  # use /latest to query recent news with category/country
+    # Prefer environment variable; override in sidebar if needed
+    NEWS_API_KEY = os.getenv("NEWSDATA_API_KEY", "")
+    NEWS_API_URL = "https://newsdata.io/api/1/latest"
     UPDATE_INTERVAL = 300
     MAX_ARTICLES = 500
 
@@ -44,94 +45,100 @@ class SimpleNewsFetcher:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "news-sentiment-monitor/1.0"})
 
-def fetch_news(self, category: Optional[str] = None, country: Optional[str] = None,
-               language: str = "en", max_pages: int = 1) -> List[Dict]:
-    """
-    Fetch news using NewsData.io /latest with cursor pagination.
-    - First request is made WITHOUT 'page' param.
-    - For subsequent requests, use the `nextPage` token returned by the API.
-    - max_pages: how many pages (requests) to follow (1 = only the first page).
-    """
-    articles: List[Dict] = []
-    page_token = None  # None => first request without 'page'
-    pages_fetched = 0
+    def fetch_news(self,
+                   category: Optional[str] = None,
+                   country: Optional[str] = None,
+                   language: str = "en",
+                   max_pages: int = 1) -> List[Dict]:
+        """
+        Fetch news using NewsData.io /latest with cursor pagination.
+        - First request made WITHOUT 'page' param.
+        - For subsequent requests, use the `nextPage` token returned by API.
+        - max_pages: how many pages to request (1 = only the first page).
+        Returns list of normalized articles.
+        """
+        articles: List[Dict] = []
+        page_token: Optional[str] = None
+        pages_fetched = 0
 
-    while pages_fetched < max_pages:
-        params = {
-            "apikey": self.api_key,
-            "language": language,
-        }
-        if category:
-            params["category"] = category
-        if country:
-            params["country"] = country
-        # only include 'page' when we have a token (NewsData expects the nextPage token)
-        if page_token:
-            params["page"] = page_token
+        while pages_fetched < max_pages:
+            params = {"apikey": self.api_key, "language": language}
+            if category:
+                params["category"] = category
+            if country:
+                params["country"] = country
+            if page_token:
+                params["page"] = page_token  # cursor token, not numeric index
 
-        try:
-            resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=12)
-        except requests.RequestException as e:
-            st.error(f"Network/API error while calling NewsData.io: {e}")
-            break
-
-        if resp.status_code != 200:
-            # show the body to debug invalid params / quota / keys
             try:
-                body = resp.json()
-            except Exception:
-                body = resp.text[:1000]
-            st.error(f"NewsData API returned {resp.status_code}: {body}")
-            break
+                resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=12)
+            except requests.RequestException as e:
+                st.error(f"Network/API error while calling NewsData.io: {e}")
+                break
 
-        try:
-            data = resp.json()
-        except ValueError:
-            st.error("NewsData returned invalid JSON")
-            break
+            # If non-200, show response body for debugging
+            if resp.status_code != 200:
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text[:1000]
+                st.error(f"NewsData API returned {resp.status_code}: {body}")
+                break
 
-        # defensive check for status / results
-        if data.get("status") not in ("success", "ok"):
-            st.error(f"NewsData non-success status: {data.get('status')} - {data.get('results') or data.get('message') or data}")
-            break
+            try:
+                data = resp.json()
+            except ValueError:
+                st.error("NewsData returned invalid JSON")
+                break
 
-        results = data.get("results") or []
-        for r in results:
-            title = (r.get("title") or "").strip()
-            if not title or title.lower() in ("[removed]", "removed"):
-                continue
-            description = (r.get("description") or r.get("content") or "").strip()
-            source = r.get("source_id") or r.get("source") or "unknown"
-            url = r.get("link") or r.get("url") or ""
-            pubdate = r.get("pubDate") or ""
+            # Response structure: { "status": "success", "results": [...], "nextPage": "..." }
+            status = data.get("status")
+            if status not in ("success", "ok"):
+                # often message is inside results or message field
+                err_info = data.get("results") or data.get("message") or data
+                st.error(f"NewsData non-success status: {status} - {err_info}")
+                break
 
-            normalized = {
-                "title": title,
-                "description": description,
-                "source": source,
-                "url": url,
-                "published_at": pubdate,
-                "category": category or r.get("category") or "unknown",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
-            articles.append(normalized)
+            results = data.get("results") or []
+            if not isinstance(results, list) or len(results) == 0:
+                # nothing to process
+                break
 
-        pages_fetched += 1
+            for r in results:
+                title = (r.get("title") or "").strip()
+                if not title or title.lower() in ("[removed]", "removed"):
+                    continue
+                description = (r.get("description") or r.get("content") or "").strip()
+                source = r.get("source_id") or r.get("source") or "unknown"
+                url = r.get("link") or r.get("url") or ""
+                pubdate = r.get("pubDate") or ""
 
-        # Respect API-provided nextPage token (cursor). If absent — stop.
-        page_token = data.get("nextPage")
-        if not page_token:
-            break
+                normalized = {
+                    "title": title,
+                    "description": description,
+                    "source": source,
+                    "url": url,
+                    "published_at": pubdate,
+                    "category": category or r.get("category") or "unknown",
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                }
+                articles.append(normalized)
 
-        # safety cap
-        if len(articles) >= Config.MAX_ARTICLES:
-            articles = articles[: Config.MAX_ARTICLES]
-            break
+            pages_fetched += 1
 
-        # gentle pause before next page
-        time.sleep(0.3)
+            # get nextPage token (cursor). If absent -> stop
+            page_token = data.get("nextPage")
+            if not page_token:
+                break
 
-    return articles
+            # safety cap
+            if len(articles) >= Config.MAX_ARTICLES:
+                articles = articles[: Config.MAX_ARTICLES]
+                break
+
+            time.sleep(0.3)
+
+        return articles
 
 # -------------------------
 # SimpleSentimentModel
@@ -284,7 +291,7 @@ class SimpleDataStore:
 class ColadNewsSentimentPipeline:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = (api_key if api_key is not None else Config.NEWS_API_KEY) or ""
-        self.fetcher = None
+        self.fetcher: Optional[SimpleNewsFetcher] = None
         if self.api_key:
             try:
                 self.fetcher = SimpleNewsFetcher(self.api_key)
@@ -304,7 +311,10 @@ class ColadNewsSentimentPipeline:
         else:
             self._load_sample_data()
 
-    def fetch_and_process_news(self, countries: Optional[List[Optional[str]]] = None, categories: Optional[List[str]] = None):
+    def fetch_and_process_news(self,
+                               countries: Optional[List[Optional[str]]] = None,
+                               categories: Optional[List[str]] = None,
+                               max_pages_per_category: int = 1):
         if not self.fetcher:
             st.warning("No API key configured — using sample data.")
             self._load_sample_data()
@@ -315,11 +325,11 @@ class ColadNewsSentimentPipeline:
         if countries is None:
             countries = [None]  # None indicates no country filter
 
-        all_articles = []
+        all_articles: List[Dict] = []
         for country in countries:
             for category in categories:
                 try:
-                    fetched = self.fetcher.fetch_news(category=category, country=country, language="en", max_pages=1)
+                    fetched = self.fetcher.fetch_news(category=category, country=country, language="en", max_pages=max_pages_per_category)
                 except Exception as e:
                     st.error(f"Error fetching {category}/{country}: {e}")
                     fetched = []
@@ -334,7 +344,7 @@ class ColadNewsSentimentPipeline:
             st.warning("No articles fetched from NewsData.io — check API key / quota.")
             return
 
-        # dedupe
+        # dedupe by url/title
         seen = set()
         unique = []
         for a in all_articles:
@@ -387,14 +397,15 @@ class ColadNewsSentimentPipeline:
         for a in sample_articles:
             text = f"{a['title']} {a.get('description','')}".strip()
             sentiment = self.model.predict_sentiment(text)
-            proc = {**a,
-                    "text": text,
-                    "sentiment": sentiment["sentiment"],
-                    "confidence": sentiment["confidence"],
-                    "probability_positive": sentiment["probability_positive"],
-                    "probability_negative": sentiment["probability_negative"],
-                    "processed_at": datetime.utcnow().isoformat() + "Z"
-                    }
+            proc = {
+                **a,
+                "text": text,
+                "sentiment": sentiment["sentiment"],
+                "confidence": sentiment["confidence"],
+                "probability_positive": sentiment["probability_positive"],
+                "probability_negative": sentiment["probability_negative"],
+                "processed_at": datetime.utcnow().isoformat() + "Z"
+            }
             processed.append(proc)
 
         self.data_store.add_processed_articles(processed)
@@ -409,7 +420,7 @@ def create_dashboard():
     st.title("📈 News Sentiment Monitor — NewsData.io")
     st.markdown("Lightweight demo that fetches headlines from NewsData.io and runs a toy sentiment classifier.")
 
-    # Sidebar
+    # Sidebar: API key + controls
     st.sidebar.header("Configuration")
     api_key_input = st.sidebar.text_input(
         "NewsData.io API Key (optional). If empty, env var NEWSDATA_API_KEY will be used.",
@@ -417,6 +428,7 @@ def create_dashboard():
         type="password",
     )
     use_sample_if_no_key = st.sidebar.checkbox("Use sample data if no key", value=True)
+    max_pages = st.sidebar.number_input("Pages per category (max 3 recommended)", min_value=1, max_value=5, value=1, step=1)
     init_button = st.sidebar.button("Initialize / Reinitialize")
 
     if "pipeline" not in st.session_state or init_button:
@@ -435,7 +447,7 @@ def create_dashboard():
     with left:
         if st.button("🔄 Refresh Data (manual)"):
             with st.spinner("Fetching latest news..."):
-                pipeline.fetch_and_process_news()
+                pipeline.fetch_and_process_news(max_pages_per_category=int(max_pages))
     with mid:
         auto_refresh = st.checkbox("Auto refresh every 30s", value=False)
     with right:
@@ -508,3 +520,4 @@ def create_dashboard():
 
 if __name__ == "__main__":
     create_dashboard()
+
