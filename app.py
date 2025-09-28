@@ -41,89 +41,61 @@ class SimpleNewsFetcher:
             raise ValueError("API key required for SimpleNewsFetcher")
         self.api_key = api_key
         self.session = requests.Session()
-        # polite user-agent
         self.session.headers.update({"User-Agent": "news-sentiment-monitor/1.0"})
 
-    def fetch_news(self, category: str = None, country: str = None, language: str = "en", max_pages: int = 1) -> List[Dict]:
-        """
-        Fetch news from NewsData.io.
-        Returns a list of normalized article dicts:
-        { title, description, source, url, published_at, category, timestamp }
-        """
-        articles: List[Dict] = []
-        params_base = {
+    def fetch_news(self, category: str = None, country: str = None, language: str = "en", page: int = 1) -> List[Dict]:
+        params = {
             "apikey": self.api_key,
             "language": language,
-            # 'category' and 'country' appended conditionally
+            "page": page
         }
-
         if category:
-            params_base["category"] = category
+            params["category"] = category
         if country:
-            params_base["country"] = country
+            params["country"] = country
 
-        # NewsData.io supports pagination via page param; fetch up to max_pages
-        for page in range(1, max_pages + 1):
-            params = dict(params_base)
-            params["page"] = page
+        try:
+            resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=10)
+        except requests.RequestException as e:
+            st.error(f"Network error while calling NewsData.io: {e}")
+            return []
+
+        # If non-200, show response body so we can debug (422 details usually in the body)
+        if resp.status_code != 200:
+            body = ""
             try:
-                resp = self.session.get(Config.NEWS_API_URL, params=params, timeout=10)
-                resp.raise_for_status()
-            except requests.RequestException as e:
-                st.error(f"Network/API error while fetching news: {e}")
-                break
+                body = resp.json()
+            except Exception:
+                body = resp.text[:1000]
+            st.error(f"NewsData API returned {resp.status_code}: {body}")
+            return []
 
-            try:
-                data = resp.json()
-            except ValueError:
-                st.error("Invalid JSON received from NewsData.io")
-                break
+        try:
+            data = resp.json()
+        except ValueError:
+            st.error("NewsData returned invalid JSON")
+            return []
 
-            # NewsData.io returns {"status": "success", "results": [...], ...}
-            status = data.get("status")
-            if status not in ("success", "ok"):
-                # make error message informative
-                message = data.get("message") or data.get("errors") or str(data)
-                st.error(f"NewsData API returned non-success status: {message}")
-                break
+        # NewsData returns {"status":"success","results":[...], ...}
+        if data.get("status") not in ("success", "ok"):
+            st.error(f"NewsData non-success status: {data.get('status')} - {data.get('message') or data}")
+            return []
 
-            results = data.get("results") or []
-            if not isinstance(results, list):
-                break
-
-            for r in results:
-                title = r.get("title") or r.get("title_full") or ""
-                # Skip invalid / removed titles
-                if not title or title.strip().lower() in ("[removed]", "removed"):
-                    continue
-
-                description = r.get("description") or r.get("content") or ""
-                source = r.get("source_id") or r.get("source") or r.get("creator") or "unknown"
-                url = r.get("link") or r.get("url") or ""
-                pubdate = r.get("pubDate") or r.get("pubDateRaw") or r.get("published_at") or ""
-
-                normalized = {
-                    "title": title.strip(),
-                    "description": description.strip(),
-                    "source": source,
-                    "url": url,
-                    "published_at": pubdate,
-                    "category": category or r.get("category") or "unknown",
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                }
-                articles.append(normalized)
-
-            # if fewer results than page-size, stop early
-            if not results:
-                break
-
-            # Safety cap
-            if len(articles) >= Config.MAX_ARTICLES:
-                articles = articles[: Config.MAX_ARTICLES]
-                break
-
-            # gentle pause between pages
-            time.sleep(0.5)
+        results = data.get("results", [])
+        articles = []
+        for r in results:
+            title = r.get("title") or ""
+            if not title or title.strip().lower() in ("[removed]", "removed"):
+                continue
+            articles.append({
+                "title": title.strip(),
+                "description": r.get("description") or "",
+                "source": r.get("source_id") or r.get("source") or "unknown",
+                "url": r.get("link") or r.get("url") or "",
+                "published_at": r.get("pubDate") or "",
+                "category": category or r.get("category") or "unknown",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            })
 
         return articles
 
